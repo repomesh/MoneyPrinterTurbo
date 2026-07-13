@@ -35,6 +35,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import bgm as bgm_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
 
@@ -73,7 +74,12 @@ fps = 30
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
 # 卡顿或最后一小段旁白没有画面的情况。
 _VIDEO_DURATION_SAFETY_MARGIN = 0.1
-_BGM_EXTENSIONS = (".mp3",)
+_MIN_MATERIAL_DIMENSION = 480
+# 消息类应用和部分编码器会把画面尺寸向下取整，例如 WhatsApp 会把 9:16 的
+# 素材压成 478x850，比 480 少两个像素。直接按 480 硬卡会让这类素材全部被
+# 丢弃，最终以 "no valid materials found" 整体失败。这里留一个很小的容差，
+# 既能放行仅仅因为取整而略低于阈值的素材，也仍然能挡住真正的低清素材。
+_MIN_DIMENSION_TOLERANCE = 10
 _DEFAULT_VIDEO_CODEC = "libx264"
 _SUPPORTED_VIDEO_CODECS = (
     "libx264",
@@ -95,6 +101,17 @@ def _get_required_video_duration(audio_duration: float) -> float:
     轻量余量。函数独立出来，便于测试和后续按实际反馈调整余量大小。
     """
     return max(0.0, float(audio_duration) + _VIDEO_DURATION_SAFETY_MARGIN)
+
+
+def is_material_resolution_acceptable(width: int, height: int) -> bool:
+    """
+    判断素材分辨率是否足够用于合成。
+
+    标称最小值是 480x480，但允许比它低 `_MIN_DIMENSION_TOLERANCE` 个像素，
+    以兼容编码器/消息应用向下取整导致的尺寸（例如 WhatsApp 的 478x850）。
+    """
+    min_dimension = _MIN_MATERIAL_DIMENSION - _MIN_DIMENSION_TOLERANCE
+    return width >= min_dimension and height >= min_dimension
 
 
 def _prioritize_unique_source_clips(
@@ -482,57 +499,27 @@ def delete_files(files: List[str] | str):
             logger.debug(f"failed to delete file {file}: {str(e)}")
 
 
-def _resolve_bgm_file_path(song_dir: str, bgm_file: str) -> str:
-    # 背景音乐只允许读取 resource/songs 目录内的文件，避免用户输入任意路径后
-    # 被 MoviePy 打开。这里兼容两种常见输入：
-    # 1. output000.mp3：来自 BGM 列表或用户只填写文件名
-    # 2. ./resource/songs/output000.mp3：用户按项目目录结构填写的相对路径
-    # 两种写法最终都会再次通过 resource/songs 白名单校验，不能绕过目录限制。
-    try:
-        return file_security.resolve_path_within_directory(song_dir, bgm_file)
-    except ValueError as song_dir_exc:
-        if os.path.isabs(bgm_file):
-            raise song_dir_exc
-
-        project_relative_file = os.path.join(utils.root_dir(), bgm_file)
-        try:
-            return file_security.resolve_path_within_directory(
-                song_dir, project_relative_file
-            )
-        except ValueError as root_dir_exc:
-            raise ValueError(str(root_dir_exc)) from song_dir_exc
-
-
 def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     if not bgm_type:
         return ""
 
     if bgm_file:
-        song_dir = utils.song_dir()
         try:
-            resolved_bgm_file = _resolve_bgm_file_path(song_dir, bgm_file)
+            resolved_bgm_file = bgm_service.resolve_bgm_file(bgm_file)
         except ValueError as exc:
-            # API 请求里的 bgm_file 来自用户输入，不能直接把任意绝对路径交给
-            # MoviePy 打开。这里强制限制到 resource/songs 目录，阻止读取
-            # /etc/passwd、配置文件、密钥等非背景音乐文件。
+            # API 请求里的 bgm_file 来自用户输入，只允许解析到用户 BGM 或内置
+            # 歌曲目录，阻止 MoviePy 读取配置、密钥等任意服务器文件。
             logger.warning(
-                f"reject unsafe bgm file: {bgm_file}, song_dir: {song_dir}, error: {str(exc)}"
+                f"reject unsafe bgm file: {bgm_file}, error: {str(exc)}"
             )
             return ""
-
-        if not resolved_bgm_file.lower().endswith(_BGM_EXTENSIONS):
-            logger.warning(f"reject unsupported bgm file extension: {resolved_bgm_file}")
-            return ""
-
         return resolved_bgm_file
 
     if bgm_type == "random":
-        suffix = "*.mp3"
-        song_dir = utils.song_dir()
-        files = glob.glob(os.path.join(song_dir, suffix))
+        files = bgm_service.list_bgm_files()
         # 当背景音乐目录为空时，直接回退为“不使用 BGM”，避免 random.choice([]) 抛异常。
         if not files:
-            logger.warning(f"no bgm files found in song directory: {song_dir}")
+            logger.warning("no background music files found")
             return ""
         return random.choice(files)
 
@@ -548,6 +535,7 @@ def combine_videos(
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
     threads: int = 2,
+    clip_speed: float = 1.0,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -566,6 +554,17 @@ def combine_videos(
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
+    if normalized_clip_speed != 1.0:
+        # 只记录一次最终生效值，既方便定位 API 越界参数被归一化的问题，
+        # 也避免在逐片段热路径中重复输出相同日志。
+        logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
+    # max_clip_duration 约束的是成片里的最终播放时长，而不是源视频读取时长。
+    # MoviePy 以 0.5 倍速播放 1.5 秒源画面会得到 3 秒片段，以 2 倍速播放
+    # 6 秒源画面同样会得到 3 秒片段。因此切片前必须按速度反推源时长；如果
+    # 仍固定读取 3 秒再慢放、裁剪，下一段却从源视频第 3 秒开始，会跳过中间
+    # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
+    source_clip_duration = max_clip_duration * normalized_clip_speed
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
@@ -583,7 +582,7 @@ def combine_videos(
         start_time = 0
 
         while start_time < clip_duration:
-            end_time = min(start_time + max_clip_duration, clip_duration)
+            end_time = min(start_time + source_clip_duration, clip_duration)
 
             # 保留所有有效分段。
             # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
@@ -627,6 +626,11 @@ def combine_videos(
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
             )
+            # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
+            # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
+            # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
+            if normalized_clip_speed != 1.0:
+                clip = clip.with_speed_scaled(normalized_clip_speed)
             clip_duration = clip.duration
             # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
@@ -661,12 +665,18 @@ def combine_videos(
                 clip = video_effects.slidein_transition(clip, 1, shuffle_side)
             elif transition_value == VideoTransitionMode.slide_out.value:
                 clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+            elif transition_value == VideoTransitionMode.zoom_in.value:
+                clip = video_effects.zoomin_transition(clip, 1)
+            elif transition_value == VideoTransitionMode.zoom_out.value:
+                clip = video_effects.zoomout_transition(clip, 1)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
                     lambda c: video_effects.fadein_transition(c, 1),
                     lambda c: video_effects.fadeout_transition(c, 1),
                     lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
                     lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                    lambda c: video_effects.zoomin_transition(c, 1),
+                    lambda c: video_effects.zoomout_transition(c, 1),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
@@ -1244,8 +1254,12 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
         try:
             width = clip.size[0]
             height = clip.size[1]
-            if width < 480 or height < 480:
-                logger.warning(f"low resolution material: {width}x{height}, minimum 480x480 required")
+            if not is_material_resolution_acceptable(width, height):
+                logger.warning(
+                    f"low resolution material: {width}x{height}, minimum "
+                    f"{_MIN_MATERIAL_DIMENSION}x{_MIN_MATERIAL_DIMENSION} required "
+                    f"(tolerance {_MIN_DIMENSION_TOLERANCE}px)"
+                )
                 # 探测到低分辨率素材后立即关闭资源，并且不要把该素材返回给后续流程。
                 close_clip(clip)
                 continue

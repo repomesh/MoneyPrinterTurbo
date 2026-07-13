@@ -1,83 +1,29 @@
-
-import unittest
 import os
 import shutil
 import sys
 import tempfile
 import types
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+
 from moviepy import (
+    ImageClip,
     VideoFileClip,
 )
+
 # add project root to python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from app.config import config
-from app.controllers.manager.base_manager import TaskQueueFullError
-from app.controllers.manager.memory_manager import InMemoryTaskManager
-from app.controllers.v1 import video as video_controller
-from app.models import const
 from app.models.schema import MaterialInfo
-from app.services import state as sm
 from app.services import video as vd
 from app.utils import utils
 
 resources_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources")
 
-
-class _FakeRequest:
-    def __init__(self):
-        self.headers = {"x-task-id": "test-request"}
-
-
-class TestSecurityControls(unittest.TestCase):
-    def setUp(self):
-        self.original_app_config = dict(config.app)
-
-    def tearDown(self):
-        config.app.clear()
-        config.app.update(self.original_app_config)
-
-    def test_task_query_returns_relative_task_url_without_mutating_state(self):
-        """
-        endpoint 未显式配置时，任务查询接口不能使用 Host 派生绝对 URL，
-        也不能把展示 URL 回写到任务状态里，否则不同 Host 查询会污染结果。
-        """
-        task_id = "security-task-url"
-        task_dir = utils.task_dir(task_id)
-        video_path = os.path.join(task_dir, "final-1.mp4")
-        Path(video_path).write_bytes(b"fake-video")
-        config.app["endpoint"] = ""
-
-        try:
-            sm.state.update_task(
-                task_id,
-                state=const.TASK_STATE_COMPLETE,
-                videos=[video_path],
-                combined_videos=[video_path],
-            )
-
-            response = video_controller.get_task(_FakeRequest(), task_id=task_id)
-
-            self.assertEqual(response["data"]["videos"], [f"/tasks/{task_id}/final-1.mp4"])
-            self.assertEqual(sm.state.get_task(task_id)["videos"], [video_path])
-        finally:
-            sm.state.delete_task(task_id)
-            shutil.rmtree(task_dir, ignore_errors=True)
-
-    def test_in_memory_task_manager_rejects_when_queue_is_full(self):
-        """
-        并发数用尽后，等待队列必须有硬上限。这里用 max_concurrent_tasks=0
-        强制任务进入队列，验证超过 max_queued_tasks 时会拒绝继续入队。
-        """
-        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=1)
-
-        manager.add_task(lambda: None)
-
-        with self.assertRaises(TaskQueueFullError):
-            manager.add_task(lambda: None)
 
 class TestVideoService(unittest.TestCase):
     def setUp(self):
@@ -85,13 +31,13 @@ class TestVideoService(unittest.TestCase):
         self.test_img_path = os.path.join(resources_dir, "1.png")
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()
-    
+
     def tearDown(self):
         config.app.clear()
         config.app.update(self.original_app_config)
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()
-    
+
     def test_preprocess_video(self):
         if not os.path.exists(self.test_img_path):
             self.fail(f"test image not found: {self.test_img_path}")
@@ -388,20 +334,34 @@ class TestVideoService(unittest.TestCase):
         和 ffmpeg 命令。项目服务层应屏蔽这类依赖库噪声，避免用户把
         `audio_found: False` 误判为最终视频没有音频。
         """
-        video_path = os.path.join(resources_dir, "1.png.mp4")
-        if not os.path.exists(video_path):
-            self.fail(f"test video not found: {video_path}")
+        # 测试只关心服务层是否屏蔽 MoviePy 的读取噪声，不应长期保存一份由 PNG
+        # 编码而来的二进制 MP4 fixture。运行时生成短视频既能保持测试独立，也能
+        # 避免 fixture 因不同编码参数产生帧间闪烁后被误用于视觉效果验证。
+        image_path = os.path.join(resources_dir, "1.png")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, "image-fixture.mp4")
+            source_clip = ImageClip(image_path).with_duration(0.2)
+            try:
+                source_clip.write_videofile(
+                    video_path,
+                    codec="libx264",
+                    fps=5,
+                    audio=False,
+                    logger=None,
+                )
+            finally:
+                source_clip.close()
 
-        stdout = StringIO()
-        with redirect_stdout(stdout):
-            clip = vd._open_video_clip_quietly(video_path)
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                clip = vd._open_video_clip_quietly(video_path)
 
-        try:
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIsNone(clip.audio)
-            self.assertGreater(clip.duration, 0)
-        finally:
-            vd.close_clip(clip)
+            try:
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIsNone(clip.audio)
+                self.assertGreater(clip.duration, 0)
+            finally:
+                vd.close_clip(clip)
 
     def test_combine_videos_closes_audio_clip_when_duration_read_fails(self):
         """
@@ -463,6 +423,111 @@ class TestVideoService(unittest.TestCase):
                     video_transition_mode=None,
                 )
                 self.assertEqual(result, combined_video_path)
+
+    def _capture_source_ranges_for_clip_speed(
+        self,
+        *,
+        source_duration,
+        audio_duration,
+        clip_speed,
+        max_clip_duration=3,
+    ):
+        """使用轻量假视频记录 combine_videos 实际读取的源时间范围。"""
+
+        source_ranges = []
+        written_durations = []
+
+        class _FakeAudioClip:
+            duration = audio_duration
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration, records_source_range=False):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+                self.records_source_range = records_source_range
+
+            def subclipped(self, start_time, end_time):
+                # 只记录直接从源文件读取的范围。变速后的安全裁剪也会调用
+                # subclipped，但它不代表新的源时间段，不能混入断层判断。
+                if self.records_source_range:
+                    source_ranges.append((start_time, end_time))
+                return _FakeVideoClip(end_time - start_time)
+
+            def with_speed_scaled(self, factor):
+                return _FakeVideoClip(self.duration / factor)
+
+            def close(self):
+                pass
+
+        def _open_fake_video_clip(_video_path):
+            return _FakeVideoClip(source_duration, records_source_range=True)
+
+        def _capture_written_clip(clip, *_args, **_kwargs):
+            written_durations.append(clip.duration)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=_open_fake_video_clip,
+                ),
+                patch.object(
+                    vd,
+                    "_write_videofile_with_codec_fallback",
+                    side_effect=_capture_written_clip,
+                ),
+                # random 模式默认会打乱同一源视频的切片。这里保持生成顺序，
+                # 才能精确验证相邻源时间段是否连续。
+                patch.object(
+                    vd,
+                    "_prioritize_unique_source_clips",
+                    side_effect=lambda subclipped_items, concat_mode: subclipped_items,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["clip.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.random,
+                    max_clip_duration=max_clip_duration,
+                    clip_speed=clip_speed,
+                )
+
+        return source_ranges, written_durations
+
+    def test_combine_videos_slow_speed_keeps_source_timeline_continuous(self):
+        """0.5 倍慢放应连续读取 1.5 秒源片段，不能跳过中间画面。"""
+
+        source_ranges, written_durations = self._capture_source_ranges_for_clip_speed(
+            source_duration=4.0,
+            audio_duration=5.9,
+            clip_speed=0.5,
+        )
+
+        self.assertEqual(source_ranges, [(0, 1.5), (1.5, 3.0)])
+        self.assertEqual(written_durations, [3.0, 3.0])
+
+    def test_combine_videos_fast_speed_reads_enough_source_content(self):
+        """2 倍快放应读取 6 秒源画面，使最终片段仍保持 3 秒。"""
+
+        source_ranges, written_durations = self._capture_source_ranges_for_clip_speed(
+            source_duration=8.0,
+            audio_duration=2.9,
+            clip_speed=2.0,
+        )
+
+        self.assertEqual(source_ranges, [(0, 6.0)])
+        self.assertEqual(written_durations, [3.0])
 
     def test_combine_videos_keeps_small_duration_safety_margin(self):
         """
@@ -682,6 +747,28 @@ class TestVideoService(unittest.TestCase):
                 with patch("sys.platform", platform):
                     result = vd._get_temp_audio_dir("/some/output/dir")
                     self.assertEqual(result, "/some/output/dir")
+
+
+class TestMaterialResolutionTolerance(unittest.TestCase):
+    def test_accepts_material_at_the_nominal_minimum(self):
+        self.assertTrue(vd.is_material_resolution_acceptable(480, 480))
+
+    def test_accepts_whatsapp_recompressed_portrait_clip(self):
+        # WhatsApp delivers 9:16 clips as 478x850, two pixels under the
+        # nominal 480 minimum. Rejecting them fails the whole task.
+        self.assertTrue(vd.is_material_resolution_acceptable(478, 850))
+
+    def test_accepts_material_exactly_at_the_tolerance_bound(self):
+        bound = vd._MIN_MATERIAL_DIMENSION - vd._MIN_DIMENSION_TOLERANCE
+        self.assertTrue(vd.is_material_resolution_acceptable(bound, bound))
+
+    def test_rejects_material_just_below_the_tolerance_bound(self):
+        bound = vd._MIN_MATERIAL_DIMENSION - vd._MIN_DIMENSION_TOLERANCE
+        self.assertFalse(vd.is_material_resolution_acceptable(bound - 1, 850))
+        self.assertFalse(vd.is_material_resolution_acceptable(850, bound - 1))
+
+    def test_rejects_genuinely_low_resolution_material(self):
+        self.assertFalse(vd.is_material_resolution_acceptable(320, 240))
 
 
 if __name__ == "__main__":

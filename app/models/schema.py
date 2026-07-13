@@ -27,6 +27,8 @@ class VideoTransitionMode(str, Enum):
     fade_out = "FadeOut"
     slide_in = "SlideIn"
     slide_out = "SlideOut"
+    zoom_in = "ZoomIn"
+    zoom_out = "ZoomOut"
 
 
 class VideoAspect(str, Enum):
@@ -77,6 +79,7 @@ class VideoParams(BaseModel):
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
     video_clip_duration: Optional[int] = 5
+    video_clip_speed: Optional[float] = 1.0
     match_materials_to_script: bool = False
     video_count: Optional[int] = 1
 
@@ -331,9 +334,9 @@ class BgmRetrieveResponse(BaseResponse):
                 "data": {
                     "files": [
                         {
-                            "name": "output013.mp3",
+                            "name": "4fca18fce7344f3aa824777a40d45c8c.mp3",
                             "size": 1891269,
-                            "file": "/MoneyPrinterTurbo/resource/songs/output013.mp3",
+                            "file": "4fca18fce7344f3aa824777a40d45c8c.mp3",
                         }
                     ]
                 },
@@ -347,7 +350,7 @@ class BgmUploadResponse(BaseResponse):
             "example": {
                 "status": 200,
                 "message": "success",
-                "data": {"file": "/MoneyPrinterTurbo/resource/songs/example.mp3"},
+                "data": {"file": "4fca18fce7344f3aa824777a40d45c8c.mp3"},
             },
         }
 
