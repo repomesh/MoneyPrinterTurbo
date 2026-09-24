@@ -1,6 +1,7 @@
 import io
 import json
 import sys
+import tempfile
 import unittest
 import wave
 from pathlib import Path
@@ -12,7 +13,7 @@ from streamlit.testing.v1 import AppTest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.config import config
-from app.services import bgm, sonilo
+from app.services import bgm, elevenlabs_music, sonilo, voice
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -74,11 +75,162 @@ class TestWebuiBackgroundMusic(unittest.TestCase):
         source_select.set_value("sonilo").run()
         return app
 
+    def _open_elevenlabs_bgm_panel(self, locale):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = locale
+        app.run()
+        source_select = self._widget_by_key(app.selectbox, "bgm_type_select")
+        source_select.set_value("elevenlabs").run()
+        return app
+
+    def _open_preset_bgm_panel(self, locale):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = locale
+        app.run()
+        source_select = self._widget_by_key(app.selectbox, "bgm_type_select")
+        source_select.set_value("preset").run()
+        return app
+
     def _uploader(self, app):
         return self._widget_by_key(app.file_uploader, "custom_bgm_uploader")
 
     def _volume_select(self, app):
         return self._widget_by_key(app.selectbox, "bgm_volume_select")
+
+    def test_preset_song_selection_is_previewed_and_persisted(self):
+        """切换预设歌曲后应立即更新播放器，并保留稳定的文件名配置。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_song = Path(temp_dir) / "first.wav"
+            second_song = Path(temp_dir) / "second.wav"
+            first_song.write_bytes(_valid_wav_bytes())
+            second_song.write_bytes(_valid_wav_bytes())
+            test_ui = dict(
+                config.ui,
+                language="en",
+                bgm_type="random",
+                preset_song=first_song.name,
+            )
+
+            with (
+                patch.object(config, "ui", test_ui),
+                patch.object(config, "try_save_config", return_value=True),
+                patch.object(
+                    bgm,
+                    "list_builtin_bgm_files",
+                    return_value=[str(first_song), str(second_song)],
+                ),
+            ):
+                app = self._open_preset_bgm_panel("en")
+                preset_select = self._widget_by_key(
+                    app.selectbox, "preset_song_select"
+                )
+                self.assertEqual(preset_select.value, first_song.name)
+                self.assertEqual(len(app.get("audio")), 1)
+
+                preset_select.set_value(second_song.name).run()
+
+            updated_select = self._widget_by_key(
+                app.selectbox, "preset_song_select"
+            )
+            self.assertEqual(updated_select.value, second_song.name)
+            self.assertEqual(test_ui["preset_song"], second_song.name)
+            self.assertEqual(len(app.get("audio")), 1)
+            self.assertEqual([str(item.value) for item in app.exception], [])
+
+    def test_empty_preset_song_list_shows_localized_warning(self):
+        """没有可用歌曲时应给出当前语言提示，而不是渲染无效选择框。"""
+        for locale in TEST_LOCALES:
+            with self.subTest(locale=locale):
+                test_ui = dict(config.ui, language=locale, bgm_type="random")
+                with (
+                    patch.object(config, "ui", test_ui),
+                    patch.object(config, "try_save_config", return_value=True),
+                    patch.object(bgm, "list_builtin_bgm_files", return_value=[]),
+                ):
+                    app = self._open_preset_bgm_panel(locale)
+
+                self.assertTrue(
+                    any(
+                        item.value
+                        == self._translation(locale, "No Background Music Available")
+                        for item in app.warning
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        str(getattr(item, "key", "")).startswith(
+                            "preset_song_select"
+                        )
+                        for item in app.selectbox
+                    )
+                )
+                self.assertEqual([str(item.value) for item in app.exception], [])
+
+    def test_task_restore_selects_the_original_preset_song(self):
+        """恢复历史任务时不能被全局保存的预设歌曲覆盖。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_song = Path(temp_dir) / "saved.wav"
+            restored_song = Path(temp_dir) / "restored.wav"
+            saved_song.write_bytes(_valid_wav_bytes())
+            restored_song.write_bytes(_valid_wav_bytes())
+            test_ui = dict(
+                config.ui,
+                language="en",
+                bgm_type="random",
+                preset_song=saved_song.name,
+            )
+
+            with (
+                patch.object(config, "ui", test_ui),
+                patch.object(config, "try_save_config", return_value=True),
+                patch.object(
+                    bgm,
+                    "list_builtin_bgm_files",
+                    return_value=[str(saved_song), str(restored_song)],
+                ),
+            ):
+                app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+                app.session_state["ui_language"] = "en"
+                app.session_state["task_restore_payload"] = {
+                    "task_id": "preset-bgm-restore-test",
+                    "params": {
+                        "bgm_type": "preset",
+                        "bgm_file": str(restored_song),
+                    },
+                }
+                app.run()
+
+            preset_select = self._widget_by_key(
+                app.selectbox, "preset_song_select"
+            )
+            self.assertEqual(preset_select.value, restored_song.name)
+            self.assertEqual(test_ui["preset_song"], restored_song.name)
+            self.assertEqual(len(app.get("audio")), 1)
+            self.assertEqual([str(item.value) for item in app.exception], [])
+
+    def test_missing_preset_song_does_not_interrupt_the_page(self):
+        """枚举后文件失效时应显示提示，并且不能创建损坏的播放器。"""
+        missing_song = Path(tempfile.gettempdir()) / "mpt-missing-preset.wav"
+        missing_song.unlink(missing_ok=True)
+        test_ui = dict(config.ui, language="en", bgm_type="random")
+
+        with (
+            patch.object(config, "ui", test_ui),
+            patch.object(config, "try_save_config", return_value=True),
+            patch.object(
+                bgm,
+                "list_builtin_bgm_files",
+                return_value=[str(missing_song)],
+            ),
+        ):
+            app = self._open_preset_bgm_panel("en")
+
+        self.assertIn(
+            self._translation("en", "Background Music Preview Failed"),
+            [item.value for item in app.warning],
+        )
+        self.assertEqual(len(app.get("audio")), 0)
+        self.assertEqual([str(item.value) for item in app.exception], [])
 
     def test_invalid_audio_shows_error_without_ready_state_or_player(self):
         for locale in TEST_LOCALES:
@@ -194,7 +346,7 @@ class TestWebuiBackgroundMusic(unittest.TestCase):
                 self.assertEqual(len(app.get("audio")), 0)
 
     def test_sonilo_source_shows_masked_prefilled_key_and_optional_prompt(self):
-        """选择 Sonilo 后应回填本机 Key，但控件必须保持密码显示模式。"""
+        """选择 Sonilo 后应回填本机 Key，且保持密码显示模式。"""
         for locale in TEST_LOCALES:
             with self.subTest(locale=locale):
                 test_config = dict(config.app, sonilo_api_key="saved-test-key")
@@ -215,14 +367,13 @@ class TestWebuiBackgroundMusic(unittest.TestCase):
                     api_key_input.label,
                     self._translation(locale, "Sonilo API Key"),
                 )
-                self.assertIn(
-                    "https://platform.sonilo.com/", api_key_input.label
-                )
+                self.assertIn("platform.sonilo.com", api_key_input.label)
                 # AppTest 的 element.type 表示控件种类（text_input）；密码模式
                 # 保存在底层 protobuf 枚举中，必须检查该字段才能验证真实渲染。
                 self.assertEqual(
                     api_key_input.proto.type, api_key_input.proto.PASSWORD
                 )
+                self.assertFalse(getattr(api_key_input.proto, "help", ""))
                 self.assertEqual(prompt_input.value, "")
                 self.assertEqual([str(item.value) for item in app.exception], [])
 
@@ -248,13 +399,182 @@ class TestWebuiBackgroundMusic(unittest.TestCase):
     def test_zero_volume_does_not_require_sonilo_key(self):
         """Sonilo 音量为 0 时，WebUI 不应继续显示 API Key 必填警告。"""
         test_config = dict(config.app, sonilo_api_key="")
+        # BGM 音量现在是可持久化的用户偏好。显式给定本测试的
+        # 非零初始条件，避免其他 AppTest 会话保存的默认值影响前置断言。
+        test_ui = dict(config.ui, bgm_volume=0.2)
         required_warning = self._translation("en", "Sonilo API Key Required")
         with (
             patch.object(config, "app", test_config),
+            patch.object(config, "ui", test_ui),
             patch.object(config, "save_config"),
             patch.object(sonilo, "is_enabled", return_value=False),
         ):
             app = self._open_sonilo_bgm_panel("en")
+            self.assertIn(required_warning, [item.value for item in app.warning])
+            self._volume_select(app).set_value(0.0).run()
+
+        self.assertNotIn(required_warning, [item.value for item in app.warning])
+        self.assertEqual([str(item.value) for item in app.exception], [])
+
+    def test_elevenlabs_source_reuses_masked_tts_key_and_shows_prompt(self):
+        """配乐和 TTS 应共用 Key，并保持密码输入和独立音乐模型配置。"""
+        for locale in TEST_LOCALES:
+            with self.subTest(locale=locale):
+                test_config = dict(
+                    config.elevenlabs,
+                    api_key="saved-elevenlabs-key",
+                    model_id="eleven_multilingual_v2",
+                    music_model_id="music_v2",
+                )
+                with (
+                    patch.object(config, "elevenlabs", test_config),
+                    patch.object(config, "save_config"),
+                ):
+                    app = self._open_elevenlabs_bgm_panel(locale)
+
+                api_key_input = self._widget_by_key(
+                    app.text_input, "elevenlabs_api_key_input"
+                )
+                prompt_input = self._widget_by_key(
+                    app.text_input, "elevenlabs_music_prompt_input"
+                )
+                self.assertEqual(api_key_input.value, "saved-elevenlabs-key")
+                self.assertEqual(
+                    api_key_input.label,
+                    self._translation(locale, "ElevenLabs Music API Key"),
+                )
+                self.assertIn(
+                    "elevenlabs.io/app/settings/api-keys",
+                    api_key_input.label,
+                )
+                self.assertEqual(
+                    api_key_input.proto.type, api_key_input.proto.PASSWORD
+                )
+                self.assertFalse(getattr(api_key_input.proto, "help", ""))
+                self.assertEqual(prompt_input.value, "")
+                self.assertEqual(
+                    test_config["model_id"], "eleven_multilingual_v2"
+                )
+                self.assertEqual([str(item.value) for item in app.exception], [])
+
+    def test_elevenlabs_tts_and_music_share_one_api_key_widget(self):
+        """同时启用配音和配乐时只能存在一个 Key 状态，修改后不能被旧值覆盖。"""
+        test_config = dict(config.elevenlabs, api_key="key-A")
+        test_ui = dict(config.ui, voice_mode="tts")
+        with (
+            patch.object(config, "elevenlabs", test_config),
+            patch.object(config, "ui", test_ui),
+            patch.object(config, "save_config"),
+            patch.object(voice, "get_elevenlabs_voices", return_value=[]),
+        ):
+            app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+            app.session_state["ui_language"] = "en"
+            app.run()
+            self._widget_by_key(
+                app.selectbox, "tts_server_select"
+            ).set_value("elevenlabs").run()
+            self._widget_by_key(
+                app.selectbox, "bgm_type_select"
+            ).set_value("elevenlabs").run()
+
+            shared_inputs = [
+                item
+                for item in app.text_input
+                if str(getattr(item, "key", "")).startswith(
+                    "elevenlabs_api_key_input"
+                )
+            ]
+            self.assertEqual(len(shared_inputs), 1)
+            self.assertEqual(shared_inputs[0].value, "key-A")
+            self.assertFalse(
+                any(
+                    str(getattr(item, "key", "")).startswith(
+                        "elevenlabs_music_api_key_input"
+                    )
+                    for item in app.text_input
+                )
+            )
+
+            shared_inputs[0].set_value("key-B").run()
+            updated_input = self._widget_by_key(
+                app.text_input, "elevenlabs_api_key_input"
+            )
+            self.assertEqual(updated_input.value, "key-B")
+            self.assertEqual(test_config["api_key"], "key-B")
+
+        self.assertEqual([str(item.value) for item in app.exception], [])
+
+    def test_elevenlabs_connection_button_reports_success(self):
+        test_config = dict(config.elevenlabs, api_key="saved-test-key")
+        with (
+            patch.object(config, "elevenlabs", test_config),
+            patch.object(config, "save_config"),
+            patch.object(
+                elevenlabs_music, "test_connection", return_value={}
+            ) as connection,
+        ):
+            app = self._open_elevenlabs_bgm_panel("en")
+            button = self._widget_by_key(
+                app.button, "test_elevenlabs_music_connection_button"
+            )
+            button.click().run()
+
+        connection.assert_called_once_with()
+        self.assertIn(
+            self._translation(
+                "en", "ElevenLabs Connection Test Succeeded"
+            ),
+            [item.value for item in app.success],
+        )
+
+    def test_elevenlabs_connection_reports_paid_plan_requirement(self):
+        """免费套餐错误应使用当前界面的自然语言，而不是直接展示英文异常。"""
+        for locale in TEST_LOCALES:
+            with self.subTest(locale=locale):
+                test_config = dict(
+                    config.elevenlabs, api_key="saved-test-key"
+                )
+                with (
+                    patch.object(config, "elevenlabs", test_config),
+                    patch.object(config, "save_config"),
+                    patch.object(
+                        elevenlabs_music,
+                        "test_connection",
+                        side_effect=(
+                            elevenlabs_music.ElevenLabsPaidPlanRequiredError(
+                                "paid plan required"
+                            )
+                        ),
+                    ),
+                ):
+                    app = self._open_elevenlabs_bgm_panel(locale)
+                    button = self._widget_by_key(
+                        app.button,
+                        "test_elevenlabs_music_connection_button",
+                    )
+                    button.click().run()
+
+                self.assertIn(
+                    self._translation(
+                        locale, "ElevenLabs Paid Plan Required"
+                    ),
+                    [item.value for item in app.error],
+                )
+
+    def test_zero_volume_does_not_require_elevenlabs_key(self):
+        """ElevenLabs 音量为 0 时同样不应要求 Key 或调用付费服务。"""
+        test_config = dict(config.elevenlabs, api_key="")
+        required_warning = self._translation(
+            "en", "ElevenLabs API Key Required"
+        )
+        with (
+            patch.object(config, "elevenlabs", test_config),
+            patch.object(config, "save_config"),
+            patch.object(
+                elevenlabs_music, "is_enabled", return_value=False
+            ),
+        ):
+            app = self._open_elevenlabs_bgm_panel("en")
             self.assertIn(required_warning, [item.value for item in app.warning])
             self._volume_select(app).set_value(0.0).run()
 
