@@ -762,6 +762,22 @@ def get_video_materials(
                 details=details,
             )
             return None
+        except (
+            material.WaveSpeedUnconfirmedTaskError,
+            material.WaveSpeedDownloadError,
+        ) as exc:
+            # Once a paid prediction exists, a polling or download failure must
+            # leave its ID in task state. Earlier successful clips cannot turn
+            # this incomplete run into an apparently completed video task.
+            prediction_id = str(getattr(exc, "prediction_id", "") or "").strip()
+            details = {"wavespeed_prediction_id": prediction_id} if prediction_id else None
+            _mark_task_failed(task_id, "materials", str(exc), details=details)
+            return None
+        except material.OpenAIImagePaidResultError as exc:
+            # A paid request with an uncertain response, failed result download,
+            # or failed local render must stop before another image order.
+            _mark_task_failed(task_id, "materials", str(exc))
+            return None
         except ofox.OFoxError as exc:
             # 与方舟同一恢复语义：未确认状态和已生成但下载失败都对应一个可在
             # OFox 控制台恢复的远端任务，统一从异常携带的 task_id 写入失败状态。
@@ -1206,18 +1222,44 @@ def _run_cross_post(
             )
 
         for video_path in video_paths:
+            pending_result_index = None
+
+            def record_background_request(request_id: str) -> None:
+                nonlocal pending_result_index
+                # Persist the remote handle before polling. If this process
+                # exits mid-upload, recovery can expose the ID to the user.
+                pending_result_index = len(results)
+                results.append(
+                    {
+                        "video_index": pending_result_index + 1,
+                        "request_id": request_id,
+                        "status": "processing",
+                    }
+                )
+                if _patch_cross_post_state(
+                    task_id, cross_post_results=list(results)
+                ) is not True:
+                    logger.warning(
+                        "could not persist background upload request ID: "
+                        f"task_id={task_id}, request_id={request_id}"
+                    )
+
             result = upload_post.cross_post_video(
                 video_path=video_path,
                 title=post_title,
                 platforms=list(platforms),
                 youtube_extra=youtube_extra,
+                on_background_start=record_background_request,
             )
             if not isinstance(result, dict):
                 result = {
                     "success": False,
                     "error": "Upload-Post returned an invalid response",
                 }
-            results.append(result)
+            if pending_result_index is None:
+                results.append(result)
+            else:
+                results[pending_result_index] = result
 
         failures = [result for result in results if not result.get("success")]
         if failures:
@@ -1494,10 +1536,18 @@ def _run_pipeline(
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
-    if not video_script or "Error: " in video_script:
+    # The LLM adapter uses a leading "Error: " as its failure sentinel. A
+    # user-provided script may legitimately quote that text anywhere, including
+    # at the beginning, so only interpret it for an LLM-generated script.
+    is_provider_error = (
+        not (params.video_script or "").strip()
+        and isinstance(video_script, str)
+        and video_script.startswith("Error: ")
+    )
+    if not video_script or is_provider_error:
         error = (
             video_script.removeprefix("Error: ").strip()
-            if isinstance(video_script, str) and "Error: " in video_script
+            if is_provider_error
             else "failed to generate video script"
         )
         return _mark_task_failed(task_id, "script", error)

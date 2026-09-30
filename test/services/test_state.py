@@ -5,11 +5,31 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.models import const
 from app.services.state import MemoryState, RedisState
+
+
+class _FakeRedisPipeline:
+    def __init__(self, redis):
+        self.redis = redis
+        self.keys = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def hget(self, key, field):
+        self.keys.append((key, field))
+        return self
+
+    def execute(self):
+        return [self.redis.data.get(key, {}).get(field.encode("utf-8")) for key, field in self.keys]
 
 
 class _FakeRedis:
@@ -37,6 +57,9 @@ class _FakeRedis:
         if isinstance(key, str):
             key = key.encode("utf-8")
         return self.data[key]
+
+    def pipeline(self, transaction=False):
+        return _FakeRedisPipeline(self)
 
     def exists(self, key):
         if isinstance(key, str):
@@ -72,6 +95,22 @@ class _FakeRedis:
 
 
 class TestMemoryState(unittest.TestCase):
+    def test_progress_update_preserves_existing_task_details(self):
+        state = MemoryState()
+        state.update_task(
+            "task-1",
+            state=const.TASK_STATE_PROCESSING,
+            video_subject="A day in Shanghai",
+            material_sources=["source.mp4"],
+        )
+
+        state.update_task("task-1", progress=25)
+
+        task = state.get_task("task-1")
+        self.assertEqual(task["progress"], 25)
+        self.assertEqual(task["video_subject"], "A day in Shanghai")
+        self.assertEqual(task["material_sources"], ["source.mp4"])
+
     def test_get_task_and_get_all_tasks_return_isolated_snapshots(self):
         state = MemoryState()
         state.update_task(
@@ -89,6 +128,32 @@ class TestMemoryState(unittest.TestCase):
 
         self.assertEqual(total, 1)
         self.assertEqual(state.get_task("task-1")["videos"], ["first.mp4"])
+
+    def test_get_all_tasks_copies_only_the_requested_page(self):
+        """A small page should not clone every historical task payload."""
+
+        class CopyTracked:
+            def __init__(self):
+                self.copies = 0
+
+            def __deepcopy__(self, memo):
+                self.copies += 1
+                return CopyTracked()
+
+        state = MemoryState()
+        off_page = CopyTracked()
+        state.update_task("task-1", videos=["first.mp4"])
+        state.update_task("task-2", payload=off_page)
+
+        first_page, total = state.get_all_tasks(page=1, page_size=1)
+
+        self.assertEqual(total, 2)
+        self.assertEqual([task["task_id"] for task in first_page], ["task-1"])
+        self.assertEqual(off_page.copies, 0)
+
+        second_page, _ = state.get_all_tasks(page=2, page_size=1)
+        self.assertEqual([task["task_id"] for task in second_page], ["task-2"])
+        self.assertEqual(off_page.copies, 1)
 
     def test_concurrent_memory_updates_are_preserved(self):
         state = MemoryState()
@@ -149,6 +214,27 @@ class TestMemoryState(unittest.TestCase):
 
 
 class TestRedisState(unittest.TestCase):
+    def test_update_task_writes_all_fields_in_one_redis_command(self):
+        state = RedisState.__new__(RedisState)
+        state._redis = Mock()
+
+        state.update_task(
+            "task-1",
+            state=const.TASK_STATE_COMPLETE,
+            progress=120,
+            videos=["final.mp4"],
+        )
+
+        state._redis.hset.assert_called_once_with(
+            "task-1",
+            mapping={
+                "task_id": "task-1",
+                "state": str(const.TASK_STATE_COMPLETE),
+                "progress": "100",
+                "videos": "['final.mp4']",
+            },
+        )
+
     def _build_state(self, batch_sizes):
         keys = [f"task:{i}".encode("utf-8") for i in range(sum(batch_sizes))]
         batches = []
@@ -212,6 +298,22 @@ class TestRedisState(unittest.TestCase):
             ["task:0", "task:1", "task:2"],
         )
         self.assertEqual(state.list_task_ids(scan_count=1), ["task:0", "task:1", "task:2"])
+
+    def test_shared_redis_db_does_not_expose_unrelated_hashes(self):
+        """Only hashes whose embedded task_id matches the key belong to this app."""
+        state = self._build_state([3])
+        state._redis.data[b"task:1"] = {b"secret": b"another service's token"}
+        state._redis.data[b"task:2"] = {
+            b"task_id": b"different-task",
+            b"secret": b"another service's token",
+        }
+
+        self.assertIsNone(state.get_task("task:1"))
+        self.assertIsNone(state.get_task("task:2"))
+        self.assertEqual(state.list_task_ids(), ["task:0"])
+        tasks, total = state.get_all_tasks(page=1, page_size=10)
+        self.assertEqual(total, 1)
+        self.assertEqual([task["task_id"] for task in tasks], ["task:0"])
 
     @unittest.skipUnless(
         os.getenv("MPT_TEST_REDIS_HOST"),
