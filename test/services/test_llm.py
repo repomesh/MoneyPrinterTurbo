@@ -394,6 +394,26 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertTrue(requesty.requires_api_key)
         self.assertEqual(requesty.api_key_url, "https://app.requesty.ai/api-keys")
         self.assertEqual(requesty.model_docs_url, "https://www.requesty.ai/models")
+        futureinfra = get_llm_provider("futureinfra")
+        self.assertEqual(futureinfra.default_model, "openai/gpt-4o-mini")
+        self.assertEqual(futureinfra.default_base_url, "https://futureinfra.ai/v1/ai")
+        self.assertEqual(futureinfra.adapter, "openai_compatible")
+        self.assertTrue(futureinfra.requires_api_key)
+        self.assertEqual(
+            futureinfra.api_key_url,
+            "https://futureinfra.ai/console/?screen=ai-router",
+        )
+        self.assertEqual(futureinfra.model_docs_url, "https://futureinfra.ai/ai/")
+        yapi = get_llm_provider("yapi")
+        self.assertEqual(yapi.default_model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(yapi.default_base_url, "https://api.y-api.bestvirtualgoods.com/v1")
+        self.assertEqual(yapi.adapter, "openai_compatible")
+        self.assertTrue(yapi.requires_api_key)
+        self.assertEqual(
+            yapi.api_key_url,
+            "https://y-api.bestvirtualgoods.com/app/keys",
+        )
+        self.assertEqual(yapi.model_docs_url, "https://y-api.bestvirtualgoods.com/models")
         pollinations = get_llm_provider("pollinations")
         self.assertEqual(pollinations.default_model, "openai-fast")
         self.assertEqual(
@@ -454,6 +474,8 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "fluxionai",
                 "cheaperinference",
                 "requesty",
+                "futureinfra",
+                "yapi",
                 "ollama",
                 "claude_code",
                 "oneapi",
