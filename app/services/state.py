@@ -11,7 +11,12 @@ from app.models import const
 
 
 _PATCH_EXISTING_TASK_SCRIPT = """
-if redis.call("EXISTS", KEYS[1]) == 0 then
+-- Match discovery/get_task ownership checks inside the same atomic operation.
+-- Other services and our queue may share this database or reuse a deleted key.
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "task_id") ~= KEYS[1] then
     return 0
 end
 
@@ -89,7 +94,7 @@ class MemoryState(BaseState):
                 "task_id": task_id,
                 "state": state,
                 "progress": progress,
-                **kwargs,
+                **copy.deepcopy(kwargs),
             }
 
     def get_task(self, task_id: str):

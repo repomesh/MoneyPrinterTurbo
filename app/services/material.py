@@ -341,7 +341,6 @@ def search_videos_pexels(
     video_aspect: VideoAspect = VideoAspect.portrait,
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
-    video_orientation = aspect.name
     video_width, video_height = aspect.to_resolution()
     api_key = get_api_key("pexels_api_keys")
     headers = {
@@ -349,7 +348,9 @@ def search_videos_pexels(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     }
     # Build URL
-    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    params = {"query": search_term, "per_page": 20}
+    if aspect != VideoAspect.square:
+        params["orientation"] = aspect.name
     query_url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
     logger.info(f"searching videos on pexels: term={search_term!r}")
 
@@ -385,7 +386,9 @@ def search_videos_pexels(
             video_files = v.get("video_files")
             if not isinstance(video_files, list):
                 continue
-            # loop through each url to determine the best quality
+            # Prefer the smallest rendition that can fill the output canvas.
+            # Square output can crop either orientation, as other providers do.
+            renditions = []
             for video in video_files:
                 if not isinstance(video, dict):
                     continue
@@ -398,34 +401,36 @@ def search_videos_pexels(
                 if not isinstance(video_url, str) or not video_url:
                     continue
                 if (
-                    _matches_video_aspect(w, h, aspect)
-                    and w == video_width
-                    and h == video_height
+                    (aspect == VideoAspect.square or _matches_video_aspect(w, h, aspect))
+                    and w >= video_width
+                    and h >= video_height
                 ):
-                    item = MaterialInfo()
-                    item.provider = "pexels"
-                    item.url = video_url
-                    item.duration = duration
-                    item.source_info = {
-                        "provider": "pexels",
-                        "search_term": search_term,
-                        "asset_id": (
-                            str(v.get("id")) if v.get("id") is not None else None
+                    renditions.append((w * h, video, w, h, video_url))
+            if renditions:
+                _, video, w, h, video_url = min(renditions, key=lambda candidate: candidate[0])
+                item = MaterialInfo()
+                item.provider = "pexels"
+                item.url = video_url
+                item.duration = duration
+                item.source_info = {
+                    "provider": "pexels",
+                    "search_term": search_term,
+                    "asset_id": (
+                        str(v.get("id")) if v.get("id") is not None else None
+                    ),
+                    "source_page": _safe_public_url(v.get("url")),
+                    "creator": _creator_info(v.get("user")),
+                    "rendition": {
+                        "id": (
+                            str(video.get("id"))
+                            if video.get("id") is not None
+                            else None
                         ),
-                        "source_page": _safe_public_url(v.get("url")),
-                        "creator": _creator_info(v.get("user")),
-                        "rendition": {
-                            "id": (
-                                str(video.get("id"))
-                                if video.get("id") is not None
-                                else None
-                            ),
-                            "width": w,
-                            "height": h,
-                        },
-                    }
-                    video_items.append(item)
-                    break
+                        "width": w,
+                        "height": h,
+                    },
+                }
+                video_items.append(item)
         return video_items
     except Exception as e:
         logger.error(
@@ -1137,8 +1142,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
 
     # Query parameters can identify the asset itself (for example,
     # /download?file_id=123). Dropping the query makes unrelated paid videos
@@ -1536,6 +1540,7 @@ def _request_openai_image(endpoint: str, payload: dict) -> tuple[bytes | None, s
                 proxies=config.proxy,
                 verify=_get_tls_verify(),
                 timeout=OPENAI_IMAGE_REQUEST_TIMEOUT,
+                allow_redirects=False,
             )
         except requests.exceptions.ConnectTimeout as e:
             # 连接阶段超时：请求确定没有送达服务端，没有创建生成任务，
@@ -1553,6 +1558,12 @@ def _request_openai_image(endpoint: str, payload: dict) -> tuple[bytes | None, s
             ) from e
         else:
             status = int(getattr(response, "status_code", 200) or 200)
+            if 300 <= status < 400:
+                response.close()
+                raise OpenAIImageUnconfirmedError(
+                    "image submission returned a redirect; no redirected request "
+                    "or retry was sent because the paid outcome is unconfirmed"
+                )
             if status in OPENAI_IMAGE_KEY_ERROR_STATUS_CODES:
                 failure_detail = _openai_image_http_failure(response, status, api_key)
                 # 只有多 key 配置下，重试才可能轮换到可用 key。
@@ -1914,11 +1925,19 @@ def _search_terms_in_parallel(
     if workers == 1:
         results = []
         for search_term in search_terms:
-            items = search_videos(
-                search_term=search_term,
-                minimum_duration=minimum_duration,
-                video_aspect=video_aspect,
-            )
+            try:
+                items = search_videos(
+                    search_term=search_term,
+                    minimum_duration=minimum_duration,
+                    video_aspect=video_aspect,
+                )
+            except Exception as exc:
+                logger.error(
+                    "failed to search material videos: "
+                    f"search_term={search_term!r}, "
+                    f"error={type(exc).__name__}"
+                )
+                items = []
             logger.info(f"found {len(items)} videos for '{search_term}'")
             results.append((search_term, items))
         return results

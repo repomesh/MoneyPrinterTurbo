@@ -89,6 +89,10 @@ VOXCPM_REFERENCE_AUDIO_FILE_TYPES = ("wav", "mp3", "m4a", "aac", "ogg", "flac")
 _DEFAULT_TTS_FFMPEG_TIMEOUT_SECONDS = 600
 _VOXCPM_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
 _VOXCPM_RETRY_DELAY_SECONDS = (1.0, 2.0)
+# Match the existing generated-speech ceiling; allow one full Base64 WAV event
+# plus JSON framing while bounding both transport lines and multiline events.
+_VOXCPM_TTS_MAX_AUDIO_BYTES = 50 * 1024 * 1024
+_VOXCPM_SSE_MAX_EVENT_BYTES = 4 * ((_VOXCPM_TTS_MAX_AUDIO_BYTES + 2) // 3) + 64 * 1024
 NO_VOICE_NAME = "no-voice"
 # `none` 是 PR #981 里曾使用过的无配音标识。这里短期兼容这个值，避免
 # 已经手动调用过该分支的 API 用户升级后立即失效；WebUI 和新代码统一使用
@@ -781,6 +785,19 @@ def _publish_tts_ffmpeg_output(
             return False
         return True
 
+
+
+def apply_audio_volume(audio_file: str, output_file: str, volume: float) -> bool:
+    """Encode narration export gain to a caller-owned destination."""
+    if not math.isfinite(volume) or volume < 0:
+        raise ValueError("audio export volume must be finite and nonnegative")
+    ensure_file_path_exists(output_file)
+    command = [
+        utils.get_ffmpeg_binary(), "-nostdin", "-v", "error", "-y",
+        "-i", audio_file, "-vn", "-af", f"volume={volume}",
+        "-codec:a", "libmp3lame", "-q:a", "4",
+    ]
+    return _publish_tts_ffmpeg_output(command, output_file, "audio export volume")
 
 def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
     """
@@ -1595,9 +1612,15 @@ def siliconflow_tts(
                 url,
                 json=payload,
                 headers=headers,
+                allow_redirects=False,
                 timeout=_SILICONFLOW_TTS_TIMEOUT_SECONDS,
             )
 
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code == 200:
                 response_accepted = True
                 if not response.content:
@@ -2269,7 +2292,12 @@ def minimax_tts(text: str, voice_id: str, voice_rate: float, voice_file: str, vo
         received_success = False
         try:
             logger.info(f"start MiniMax TTS, model: {model}, voice: {voice_id}, try: {attempt + 1}")
-            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response = requests.post(url, json=payload, headers=headers, allow_redirects=False, timeout=120)
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code != 200:
                 logger.error(f"MiniMax TTS failed with status {response.status_code}: {response.text[:200]}")
                 continue
@@ -2511,7 +2539,12 @@ def _openai_compatible_tts(
             logger.info(f"start {provider} tts, voice: {voice}, try: {i + 1}")
             ensure_file_path_exists(voice_file)
 
-            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response = requests.post(url, json=payload, headers=headers, allow_redirects=False, timeout=120)
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code != 200:
                 logger.error(
                     f"{provider} tts failed with status {response.status_code}: {response.text[:200]}"
@@ -2547,6 +2580,18 @@ def _openai_compatible_tts(
                 text=text,
                 audio_duration_seconds=audio_duration,
             )
+        except requests.exceptions.ConnectTimeout:
+            # No connection was established; retrying cannot replay synthesis.
+            logger.warning(f"{provider} tts could not connect, retrying")
+        except requests.exceptions.RequestException as exc:
+            # A lost response can follow successful remote synthesis. Keep the
+            # same acceptance boundary as hosted speech providers: do not POST
+            # again when the first request's outcome is unknown.
+            logger.error(
+                f"{provider} tts result is unconfirmed after a transport error; "
+                f"stop speech retries: {type(exc).__name__}"
+            )
+            return None
         except Exception as e:
             logger.error(f"{provider} tts failed: {str(e)}")
             if response_accepted:
@@ -2746,7 +2791,12 @@ def fish_audio_tts(
             )
             ensure_file_path_exists(voice_file)
 
-            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            response = requests.post(url, json=payload, headers=headers, allow_redirects=False, timeout=60)
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code == 401:
                 logger.error(
                     "Fish Audio TTS failed: Invalid API key (401). "
@@ -2830,25 +2880,63 @@ def fish_audio_tts(
 
 
 def _iter_voxcpm_sse_events(response):
-    """Yield JSON payloads from ModelBest's Server-Sent Event stream."""
+    """Yield bounded SSE events without Requests' unbounded line buffer."""
+    def lines():
+        pending = bytearray()
+        skip_lf = False
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            # Consume the optional LF after a CR, even across transport chunks.
+            if skip_lf:
+                skip_lf = False
+                if chunk.startswith(b"\n"):
+                    chunk = chunk[1:]
+                if not chunk:
+                    continue
+            for piece in chunk.splitlines(keepends=True):
+                if piece.endswith(b"\r\n"):
+                    payload, terminated = piece[:-2], True
+                elif piece.endswith((b"\r", b"\n")):
+                    payload, terminated = piece[:-1], True
+                else:
+                    payload, terminated = piece, False
+                if len(pending) + len(payload) > _VOXCPM_SSE_MAX_EVENT_BYTES:
+                    raise ValueError("VoxCPM SSE line exceeds the size limit")
+                pending.extend(payload)
+                if terminated:
+                    yield bytes(pending).decode("utf-8")
+                    pending.clear()
+            skip_lf = chunk.endswith(b"\r")
+        if pending:
+            yield bytes(pending).decode("utf-8")
+
+    def parse_event(data):
+        try:
+            event = json.loads("\n".join(data))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("VoxCPM returned invalid SSE event data") from exc
+        if not isinstance(event, dict):
+            raise ValueError("VoxCPM returned a non-object SSE event")
+        return event
+
     event_data = []
-    for raw_line in response.iter_lines(decode_unicode=True):
-        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+    event_bytes = 0
+    for line in lines():
         if not line:
             if event_data:
-                try:
-                    yield json.loads("\n".join(event_data))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("VoxCPM returned invalid SSE event data") from exc
+                yield parse_event(event_data)
                 event_data = []
+                event_bytes = 0
             continue
         if line.startswith("data:"):
-            event_data.append(line.removeprefix("data:").strip())
+            data = line.removeprefix("data:").strip()
+            event_bytes += len(data.encode("utf-8")) + 1
+            if event_bytes > _VOXCPM_SSE_MAX_EVENT_BYTES:
+                raise ValueError("VoxCPM SSE event exceeds the size limit")
+            event_data.append(data)
     if event_data:
-        try:
-            yield json.loads("\n".join(event_data))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("VoxCPM returned invalid trailing SSE event data") from exc
+        yield parse_event(event_data)
 
 
 def prepare_voxcpm_reference_audio(uploaded_audio: bytes, suffix: str = "") -> bytes:
@@ -3046,9 +3134,15 @@ def voxcpm_tts(
                 url,
                 json=payload,
                 headers=headers,
+                allow_redirects=False,
                 stream=True,
                 timeout=(10, 120),
             )
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code != 200:
                 logger.error(
                     f"VoxCPM TTS failed with status {response.status_code}: "
@@ -3061,6 +3155,7 @@ def voxcpm_tts(
                 continue
 
             audio_chunks = []
+            total_audio_bytes = 0
             completed = False
             for event in _iter_voxcpm_sse_events(response):
                 event_type = event.get("type")
@@ -3069,9 +3164,13 @@ def voxcpm_tts(
                     if not isinstance(encoded_chunk, str) or not encoded_chunk:
                         raise ValueError("VoxCPM returned an empty audio chunk")
                     try:
-                        audio_chunks.append(base64.b64decode(encoded_chunk, validate=True))
+                        chunk = base64.b64decode(encoded_chunk, validate=True)
                     except (ValueError, TypeError) as exc:
                         raise ValueError("VoxCPM returned invalid Base64 audio") from exc
+                    total_audio_bytes += len(chunk)
+                    if total_audio_bytes > _VOXCPM_TTS_MAX_AUDIO_BYTES:
+                        raise ValueError("VoxCPM generated audio exceeds the size limit")
+                    audio_chunks.append(chunk)
                 elif event_type == "speech.audio.done":
                     completed = True
                     break
