@@ -21,7 +21,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from PIL import Image, UnidentifiedImageError
 
 from app.config import config
-from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.models.schema import ImageMotion, MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import (
     material_cache,
     material_upload,
@@ -878,6 +878,14 @@ def generate_videos_wavespeed(
     try:
         submit_body = submit_response.json()
     except Exception as e:
+        if 400 <= submit_status < 500:
+            # 网关或鉴权层返回的 4xx 可能是纯文本/HTML。4xx 仍是明确拒绝，
+            # 远端没有创建任务，不能误报为“可能已计费”而终止整个任务。
+            logger.error(
+                "wavespeed video generation request rejected: "
+                f"http_status={submit_status}, unreadable body: {type(e).__name__}"
+            )
+            return []
         raise WaveSpeedUnconfirmedTaskError(
             "wavespeed submission returned an unreadable response, the task "
             f"may already exist remotely: error={type(e).__name__}"
@@ -1729,14 +1737,18 @@ def generate_images_openai(
     return [item]
 
 
-def _render_openai_image_video(image_path: str, clip_duration: int) -> str:
+def _render_openai_image_video(
+    image_path: str, clip_duration: int, image_motion: ImageMotion = ImageMotion.zoom
+) -> str:
     """
     把生成的图片渲染成 mp4 片段，复用 local 素材的"图片 → 动态片段"管线。
 
     渲染失败返回空字符串，由调用方停止后续付费请求。
     """
     try:
-        return video.render_image_zoom_video(image_path, clip_duration)
+        return video.render_image_zoom_video(
+            image_path, clip_duration, image_motion=image_motion
+        )
     except Exception as e:
         logger.error(
             "failed to render generated image as a video clip: "
@@ -1753,6 +1765,7 @@ def _download_videos_openai_image_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    image_motion: ImageMotion = ImageMotion.zoom,
 ) -> List[str]:
     """
     按脚本片段顺序逐张生成 OpenAI 兼容文生图素材，凑够所需总时长立即停止。
@@ -1763,6 +1776,8 @@ def _download_videos_openai_image_on_demand(
     不再发起新的付费请求。明确拒绝的单张图片可跳过；请求结果不明、付费
     结果下载失败或本地渲染失败时必须终止任务，避免后续关键词再次计费。
     """
+    # 直接调用素材服务也要在付费请求前校验，不能生成后才发现效果参数无效。
+    image_motion = ImageMotion(image_motion)
     if not material_directory:
         # 生成图片按任务计费且不可复用，默认落在任务目录便于追溯。
         material_directory = utils.task_dir(task_id)
@@ -1797,7 +1812,9 @@ def _download_videos_openai_image_on_demand(
             _persist_material_sources(task_id, material_sources)
             raise
         for item in items:
-            video_file = _render_openai_image_video(item.url, max_clip_duration)
+            video_file = _render_openai_image_video(
+                item.url, max_clip_duration, image_motion=image_motion
+            )
             if not video_file:
                 _persist_material_sources(task_id, material_sources)
                 raise OpenAIImagePaidResultError(
@@ -2151,6 +2168,7 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
     progress_callback: Callable[[float], None] | None = None,
+    image_motion: ImageMotion = ImageMotion.zoom,
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
@@ -2257,6 +2275,7 @@ def download_videos(
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+            image_motion=image_motion,
         )
 
     if match_script_order:
